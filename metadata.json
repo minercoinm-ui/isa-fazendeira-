@@ -1,0 +1,6 @@
+{
+  "name": "Fazendinha da Isa",
+  "description": "Jogo 3D educativo e colaborativo com simulação de fazenda, feira e NPCs compradores autônomos integrados ao Supabase.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
