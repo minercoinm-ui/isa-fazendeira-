@@ -352,349 +352,56 @@ export async function performMarketFarmAction(
   plotId: number,
   action: MarketFarmAction,
   cropType?: string,
-  harvestOptions?: { mode: 'A' | 'B' | 'C'; marketPct: number }
+  _harvestOptions?: { mode: 'A' | 'B' | 'C'; marketPct: number }
 ): Promise<MarketStateSnapshot> {
-  if (!Number.isSafeInteger(plotId) || plotId < 0 || plotId > 63) throw new Error('Talhão inválido.');
+  // O schema ativo do Supabase possui talhões 0–7 e a RPC aceita exatamente
+  // (p_plot_id integer, p_action text, p_crop_type text).
+  if (!Number.isSafeInteger(plotId) || plotId < 0 || plotId > 7) {
+    throw new Error('Talhão inválido. Os talhões disponíveis vão de 0 a 7.');
+  }
+
   const client = await getAuthenticatedClient(playerId);
-
-  const safeCrop = cropType || 'corn';
-  const cropMeta = safeCrop in CROPS_CATALOG ? CROPS_CATALOG[safeCrop as keyof typeof CROPS_CATALOG] : null;
-  const growthDuration = cropMeta?.growthTime || 22;
-  const harvestMode = harvestOptions?.mode || 'C';
-  const marketPct = harvestOptions?.marketPct !== undefined ? harvestOptions.marketPct : 70;
-
-  // Cálculo da distribuição atômica de 2 unidades
-  let marketUnits = 0;
-  let backpackUnits = 2;
-  if (harvestMode === 'A') {
-    marketUnits = 2;
-    backpackUnits = 0;
-  } else if (harvestMode === 'B') {
-    marketUnits = 0;
-    backpackUnits = 2;
-  } else {
-    marketUnits = Math.round(2 * (marketPct / 100));
-    backpackUnits = 2 - marketUnits;
-  }
-
   if (!client) {
-    if (!localMarketState) localMarketState = createFallbackMarketState(playerId);
-    const plot = localMarketState.farm_plots.find((p) => p.id === plotId);
-    if (plot) {
-      if (action === 'plant') {
-        plot.cropType = safeCrop;
-        plot.stage = 1;
-        plot.watered = false;
-        plot.plantedAt = new Date().toISOString();
-        plot.growthTime = growthDuration;
-        const seedId = `${safeCrop}_seed`;
-        const item = localMarketState.inventory.find((i) => i.item_id === seedId);
-        if (item && item.quantity > 0) item.quantity--;
-      } else if (action === 'water') {
-        plot.watered = true;
-      } else if (action === 'harvest') {
-        if (!plot.cropType) throw new Error('Talhão vazio.');
-        const currentStage = calculatePlotStage(
-          plot.plantedAt ? Date.parse(plot.plantedAt) : null,
-          plot.growthTime || 25,
-          plot.watered,
-          plot.stage
-        );
-        if (currentStage < 5) {
-          throw new Error('Esta plantação ainda está crescendo e não pode ser colhida antes de madura!');
-        }
-
-        const harvestedCrop = plot.cropType;
-        // 1. Mochila
-        if (backpackUnits > 0) {
-          const item = localMarketState.inventory.find((i) => i.item_id === harvestedCrop);
-          if (item) item.quantity += backpackUnits;
-          else localMarketState.inventory.push({ item_id: harvestedCrop, quantity: backpackUnits });
-        }
-        // 2. Barraca
-        if (marketUnits > 0) {
-          const existingListing = localMarketState.listings.find((l) => l.product_id === harvestedCrop && l.seller_id === playerId);
-          if (existingListing) {
-            existingListing.quantity += marketUnits;
-          } else {
-            const prodInfo = localMarketState.products.find((p) => p.product_id === harvestedCrop);
-            localMarketState.listings.push({
-              id: `list-${playerId}-${harvestedCrop}-${Date.now()}`,
-              stall_id: localMarketState.stall?.id || `stall-${playerId.slice(0, 8)}`,
-              seller_id: playerId,
-              seller_name: localMarketState.player.nickname,
-              stall_name: localMarketState.stall?.stall_name || 'Barraca',
-              product_id: harvestedCrop,
-              product_name: prodInfo?.name || harvestedCrop,
-              icon: prodInfo?.icon || '🌾',
-              category: prodInfo?.category || 'crop',
-              quantity: marketUnits,
-              price_per_unit: prodInfo?.recommended_price || 25,
-              sold_count: 0,
-              updated_at: new Date().toISOString(),
-            });
-          }
-        }
-
-        plot.cropType = null;
-        plot.stage = 0;
-        plot.watered = false;
-        plot.plantedAt = null;
-      }
-    }
-    return { ...localMarketState };
+    throw new Error('Sua sessão não está válida. Entre novamente para salvar o progresso.');
   }
-
-  // 1. Tentar executar a Stored Procedure oficial no Supabase
-  let rpcSucceeded = false;
-  let newState: MarketStateSnapshot | null = null;
-  const nowIso = new Date().toISOString();
-
-  try {
-    // Se for plantio, assegura no Supabase que existe ao menos 1 semente registrada para a RPC não lançar erro
-    if (action === 'plant') {
-      const seedId = `${safeCrop}_seed`;
-      const { data: invRows } = await client
-        .from('player_inventory')
-        .select('quantity')
-        .eq('player_id', playerId)
-        .eq('item_id', seedId);
-
-      const curCount = invRows?.[0]?.quantity ?? 0;
-      if (curCount < 1) {
-        await client.from('player_inventory').upsert(
-          {
-            player_id: playerId,
-            item_id: seedId,
-            category: 'seed',
-            quantity: 3,
-            updated_at: nowIso,
-          },
-          { onConflict: 'player_id,item_id' }
-        );
-      }
-    }
-
-    newState = await callStateRpc(client, 'market_farm_action', {
-      p_plot_id: plotId,
-      p_action: action,
-      p_crop_type: cropType ?? null,
-      p_harvest_mode: harvestMode,
-      p_market_pct: marketPct,
-    });
-
-    const targetPlot = newState?.farm_plots.find((p) => p.id === plotId);
-    if (action === 'plant' && targetPlot && targetPlot.cropType) {
-      rpcSucceeded = true;
-    } else if (action === 'water' && targetPlot && targetPlot.watered) {
-      rpcSucceeded = true;
-    } else if (action === 'harvest' && targetPlot && !targetPlot.cropType) {
-      rpcSucceeded = true;
-    }
-  } catch (rpcErr) {
-    console.warn('RPC market_farm_action aviso, aplicando persistência direta em tabelas do Supabase:', rpcErr);
-  }
-
-  if (rpcSucceeded && newState) {
-    localMarketState = newState;
-    return newState;
-  }
-
-  // 2. Persistência direta em tabelas do Supabase (Garantia de 100% de salvamento de progresso)
-  if (!localMarketState) localMarketState = createFallbackMarketState(playerId);
-  const localPlot = localMarketState.farm_plots.find((p) => p.id === plotId);
 
   if (action === 'plant') {
-    // Atualiza tabela farm_plots no Supabase
-    const { error: plotErr } = await client
-      .from('farm_plots')
-      .update({
-        crop_type: safeCrop,
-        stage: 1,
-        is_watered: false,
-        planted_by: playerId,
-        planted_at: nowIso,
-        growth_duration_seconds: growthDuration,
-        updated_at: nowIso,
-      })
-      .eq('id', plotId);
-
-    if (plotErr) console.warn('Supabase farm_plots update aviso:', plotErr);
-
-    // Consome semente em player_inventory no Supabase
-    const seedId = `${safeCrop}_seed`;
-    try {
-      const { data: invRows } = await client
-        .from('player_inventory')
-        .select('quantity')
-        .eq('player_id', playerId)
-        .eq('item_id', seedId);
-
-      const curQty = invRows?.[0]?.quantity ?? 0;
-      await client
-        .from('player_inventory')
-        .update({
-          quantity: Math.max(0, curQty - 1),
-          updated_at: nowIso,
-        })
-        .eq('player_id', playerId)
-        .eq('item_id', seedId);
-    } catch (invErr) {
-      console.warn('Erro ao atualizar semente em player_inventory no Supabase:', invErr);
-    }
-
-    if (localPlot) {
-      localPlot.cropType = safeCrop;
-      localPlot.stage = 1;
-      localPlot.watered = false;
-      localPlot.plantedAt = nowIso;
-      localPlot.growthTime = growthDuration;
-      localPlot.ownerId = playerId;
-    }
-    const localSeedItem = localMarketState.inventory.find((i) => i.item_id === seedId);
-    if (localSeedItem && localSeedItem.quantity > 0) localSeedItem.quantity--;
-
-  } else if (action === 'water') {
-    await client
-      .from('farm_plots')
-      .update({
-        is_watered: true,
-        updated_at: nowIso,
-      })
-      .eq('id', plotId);
-
-    if (localPlot) {
-      localPlot.watered = true;
-    }
-
-  } else if (action === 'harvest') {
-    const harvestedCrop = localPlot?.cropType || cropType || 'corn';
-
-    // Validação estrita de maturação
-    const currentStage = calculatePlotStage(
-      localPlot?.plantedAt ? Date.parse(localPlot.plantedAt) : null,
-      localPlot?.growthTime || growthDuration,
-      localPlot?.watered || false,
-      localPlot?.stage
-    );
-    if (currentStage < 5) {
-      throw new Error('Esta plantação ainda está crescendo e não pode ser colhida antes de madura!');
-    }
-
-    await client
-      .from('farm_plots')
-      .update({
-        crop_type: null,
-        stage: 0,
-        is_watered: false,
-        planted_by: null,
-        planted_at: null,
-        updated_at: nowIso,
-      })
-      .eq('id', plotId);
-
-    // 1. Salvar na mochila (se > 0)
-    if (backpackUnits > 0) {
-      try {
-        const { data: existCrop } = await client
-          .from('player_inventory')
-          .select('quantity')
-          .eq('player_id', playerId)
-          .eq('item_id', harvestedCrop);
-
-        const curCount = existCrop?.[0]?.quantity ?? 0;
-        await client.from('player_inventory').upsert(
-          {
-            player_id: playerId,
-            item_id: harvestedCrop,
-            category: 'crop',
-            quantity: curCount + backpackUnits,
-            updated_at: nowIso,
-          },
-          { onConflict: 'player_id,item_id' }
-        );
-      } catch (harvestErr) {
-        console.warn('Erro ao salvar colheita em player_inventory no Supabase:', harvestErr);
-      }
-    }
-
-    // 2. Salvar no mercado / barraca (se > 0)
-    if (marketUnits > 0) {
-      try {
-        const prodInfo = localMarketState.products.find((p) => p.product_id === harvestedCrop);
-        const stallId = `stall-${playerId.slice(0, 8)}`;
-        const listingId = `list-${playerId}-${harvestedCrop}`;
-
-        const { data: existListing } = await client
-          .from('market_listings')
-          .select('id, quantity')
-          .eq('id', listingId)
-          .maybeSingle();
-
-        const curListQty = existListing?.quantity ?? 0;
-        await client.from('market_listings').upsert(
-          {
-            id: listingId,
-            stall_id: stallId,
-            seller_id: playerId,
-            seller_name: localMarketState.player.nickname,
-            stall_name: `Barraca de ${localMarketState.player.nickname}`,
-            product_id: harvestedCrop,
-            product_name: prodInfo?.name || harvestedCrop,
-            icon: prodInfo?.icon || '🌾',
-            category: prodInfo?.category || 'crop',
-            quantity: curListQty + marketUnits,
-            price_per_unit: prodInfo?.recommended_price || 25,
-            status: 'active',
-            updated_at: nowIso,
-          },
-          { onConflict: 'id' }
-        );
-      } catch (marketErr) {
-        console.warn('Erro ao salvar abastecimento no mercado no Supabase:', marketErr);
-      }
-    }
-
-    if (localPlot) {
-      localPlot.cropType = null;
-      localPlot.stage = 0;
-      localPlot.watered = false;
-      localPlot.plantedAt = null;
-      localPlot.ownerId = null;
-    }
-
-    if (backpackUnits > 0) {
-      const localItem = localMarketState.inventory.find((i) => i.item_id === harvestedCrop);
-      if (localItem) localItem.quantity += backpackUnits;
-      else localMarketState.inventory.push({ item_id: harvestedCrop, quantity: backpackUnits });
-    }
-
-    if (marketUnits > 0) {
-      const existList = localMarketState.listings.find((l) => l.product_id === harvestedCrop && l.seller_id === playerId);
-      if (existList) {
-        existList.quantity += marketUnits;
-      } else {
-        const prodInfo = localMarketState.products.find((p) => p.product_id === harvestedCrop);
-        localMarketState.listings.push({
-          id: `list-${playerId}-${harvestedCrop}`,
-          stall_id: `stall-${playerId.slice(0, 8)}`,
-          seller_id: playerId,
-          seller_name: localMarketState.player.nickname,
-          stall_name: `Barraca de ${localMarketState.player.nickname}`,
-          product_id: harvestedCrop,
-          product_name: prodInfo?.name || harvestedCrop,
-          icon: prodInfo?.icon || '🌾',
-          category: prodInfo?.category || 'crop',
-          quantity: marketUnits,
-          price_per_unit: prodInfo?.recommended_price || 25,
-          sold_count: 0,
-          updated_at: nowIso,
-        });
-      }
+    if (!cropType || !(cropType in CROPS_CATALOG)) {
+      throw new Error('Selecione uma cultura válida antes de plantar.');
     }
   }
 
-  return { ...localMarketState };
+  // Não criar sementes artificialmente, não gravar em tabelas antigas e não
+  // simular sucesso local. A função SQL valida sementes, dono e estado do talhão.
+  const { data, error } = await client.rpc('market_farm_action', {
+    p_plot_id: plotId,
+    p_action: action,
+    p_crop_type: action === 'plant' ? cropType : null,
+  });
+
+  if (error) {
+    console.error('Falha real na RPC market_farm_action:', error);
+    throw marketOperationError(error);
+  }
+
+  const newState = parseMarketState(data);
+  const updatedPlot = newState.farm_plots.find((plot) => plot.id === plotId);
+  if (!updatedPlot) {
+    throw new Error('O Supabase não retornou o talhão atualizado. A operação não foi confirmada.');
+  }
+
+  const confirmed =
+    (action === 'plant' && updatedPlot.cropType === cropType) ||
+    (action === 'water' && updatedPlot.watered === true) ||
+    (action === 'harvest' && updatedPlot.cropType === null);
+
+  if (!confirmed) {
+    throw new Error('O Supabase não confirmou a alteração do talhão. O estado anterior foi mantido.');
+  }
+
+  // Atualiza o cache somente depois da confirmação do banco.
+  localMarketState = newState;
+  return newState;
 }
 
 export async function loadHarvestPreferenceFromSupabase(
